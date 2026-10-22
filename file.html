@@ -1,0 +1,1785 @@
+# -*- coding: utf-8 -*-
+"""
+CodeMind AI - Your Intelligent AI Coding Companion
+===================================================
+A complete AI coding chatbot in ONE file (Flask + SQLite + embedded HTML/CSS/JS).
+
+QUICK START (Windows, PowerShell or Command Prompt)
+---------------------------------------------------
+1. Put this file in a folder, for example  C:\\codemind  and name it  app.py
+2. Install packages:
+       python -m pip install flask python-dotenv openai google-genai
+3. Create a file named  .env  in the SAME folder with these lines:
+       AI_PROVIDER=openai
+       OPENAI_API_KEY=paste-your-openai-key-here
+       GEMINI_API_KEY=paste-your-gemini-key-here
+   (You only need the key for the provider you use.)
+4. Run:
+       python app.py
+5. Open  http://127.0.0.1:5000  in your browser.
+
+SECURITY NOTE
+-------------
+This app has NO login. It is meant for personal use on your own, trusted
+computer (it only listens on 127.0.0.1). Do not expose it to the internet
+without adding authentication and a production web server.
+"""
+
+import logging
+import os
+import re
+import secrets
+import sqlite3
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+from flask import Flask, g, jsonify, render_template_string, request
+from werkzeug.exceptions import HTTPException
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Load variables from a local .env file if python-dotenv is installed.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(BASE_DIR, ".env"))
+except ImportError:
+    pass
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+APP_NAME = "CodeMind AI"
+APP_TAGLINE = "Your Intelligent AI Coding Companion"
+APP_VERSION = "1.0.0"
+
+DB_PATH = os.path.join(BASE_DIR, "codemind.db")
+MAX_MESSAGE_CHARS = 8000          # longest user message accepted
+MAX_TITLE_CHARS = 60              # auto-generated title limit
+MAX_RENAME_CHARS = 80             # manual rename limit
+CONTEXT_MAX_MESSAGES = 20         # most recent messages sent to the AI
+CONTEXT_MAX_CHARS = 24000         # character budget for the AI context
+AI_TIMEOUT_SECONDS = 60           # timeout for every AI request
+ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# Supported providers and models. You can also add any model name through the
+# OPENAI_MODEL / GEMINI_MODEL environment variables; it becomes selectable.
+PROVIDERS = {
+    "openai": {
+        "label": "OpenAI",
+        "env_var": "OPENAI_API_KEY",
+        "model_env": "OPENAI_MODEL",
+        "default_model": "gpt-4o-mini",
+        "models": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-4o"],
+    },
+    "gemini": {
+        "label": "Google Gemini",
+        "env_var": "GEMINI_API_KEY",
+        "model_env": "GEMINI_MODEL",
+        "default_model": "gemini-2.5-flash",
+        "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-2.0-flash"],
+    },
+}
+
+SYSTEM_PROMPT = """You are CodeMind AI, a friendly, expert AI coding tutor and programming assistant for students, beginners, and developers.
+
+How you behave:
+- Answer naturally and accurately, and remember the earlier messages of this conversation.
+- Explain difficult ideas in simple language, step by step, and use small examples when they help.
+- When the user submits code: understand it, identify the programming language, work out the user's goal, find bugs when asked, show corrected code, and explain every change.
+- Explain compiler errors and runtime errors in plain words and show how to fix them.
+- Write clean, correct, well-commented code in Python, Java, C, C++, JavaScript, HTML, CSS, SQL and other common languages.
+- Help with debugging, optimization, refactoring, converting code between languages, algorithms, data structures, time and space complexity, competitive programming, unit tests, Git and GitHub, databases, APIs, operating systems, networking, software engineering, and technical interviews.
+- Explain code line by line when asked.
+- Recommend secure coding practices (input validation, parameterized SQL, safe secrets handling).
+- Format answers in Markdown. Always put code in fenced code blocks with the language name, for example ```python.
+- If you are unsure or lack information, say so honestly instead of guessing. Ask a short clarifying question if the request is ambiguous.
+- Never claim to have executed code. You cannot run code; reason about it carefully instead.
+- Decline requests to create malware or to help with clearly harmful activity, and offer a safe alternative."""
+
+
+# ---------------------------------------------------------------------------
+# Flask application setup
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("codemind")
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"] = 128 * 1024  # reject request bodies over 128 KB
+
+
+class ApiError(Exception):
+    """An error that is safe to show to the user as JSON."""
+
+    def __init__(self, code, message, status=400, retryable=False):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.retryable = retryable
+
+
+class AIError(ApiError):
+    """A failure while talking to the AI provider (user's message stays saved)."""
+
+    def __init__(self, code, message, status=502):
+        super().__init__(code, message, status, retryable=True)
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id         TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content         TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages (conversation_id, id);
+CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations (updated_at DESC);
+"""
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def init_db():
+    """Create the database file and tables automatically."""
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_db():
+    """One SQLite connection per request, with foreign keys enforced."""
+    if "db" not in g:
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        g.db = conn
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_exc):
+    conn = g.pop("db", None)
+    if conn is not None:
+        conn.close()
+
+
+def get_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn, key, value):
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Provider / model configuration helpers
+# ---------------------------------------------------------------------------
+def get_api_key(provider):
+    """Read the API key from environment variables (never sent to the browser)."""
+    names = [PROVIDERS[provider]["env_var"]]
+    if provider == "gemini":
+        names.append("GOOGLE_API_KEY")
+    for name in names:
+        value = (os.environ.get(name) or "").strip().strip('"').strip("'")
+        if value and not value.lower().startswith(("your", "paste")):
+            return value
+    return ""
+
+
+def mask_key(key):
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "\u2022\u2022\u2022\u2022"
+    return key[:3] + "\u2026" + key[-4:]
+
+
+def models_for(provider):
+    cfg = PROVIDERS[provider]
+    models = list(cfg["models"])
+    extra = (os.environ.get(cfg["model_env"]) or "").strip()
+    if extra and extra not in models:
+        models.insert(0, extra)
+    return models
+
+
+def active_ai(conn):
+    """Return the (provider, model) currently selected."""
+    provider = get_setting(conn, "provider") or os.environ.get("AI_PROVIDER", "openai").strip().lower()
+    if provider not in PROVIDERS:
+        provider = "openai"
+    cfg = PROVIDERS[provider]
+    model = get_setting(conn, "model_" + provider) or (os.environ.get(cfg["model_env"]) or "").strip()
+    if model not in models_for(provider):
+        model = cfg["default_model"]
+    return provider, model
+
+
+def settings_payload(conn):
+    provider, model = active_ai(conn)
+    theme = get_setting(conn, "theme", "light")
+    providers = []
+    for pid, cfg in PROVIDERS.items():
+        key = get_api_key(pid)
+        providers.append(
+            {
+                "id": pid,
+                "label": cfg["label"],
+                "env_var": cfg["env_var"],
+                "configured": bool(key),
+                "masked_key": mask_key(key),
+                "models": models_for(pid),
+                "model": active_model_for(conn, pid),
+            }
+        )
+    return {
+        "provider": provider,
+        "model": model,
+        "theme": theme if theme in ("light", "dark") else "light",
+        "providers": providers,
+        "app": {"name": APP_NAME, "tagline": APP_TAGLINE, "version": APP_VERSION},
+    }
+
+
+def active_model_for(conn, provider):
+    cfg = PROVIDERS[provider]
+    model = get_setting(conn, "model_" + provider) or (os.environ.get(cfg["model_env"]) or "").strip()
+    return model if model in models_for(provider) else cfg["default_model"]
+
+
+# ---------------------------------------------------------------------------
+# AI provider calls
+# ---------------------------------------------------------------------------
+def ai_error_from_status(label, status, text):
+    """Turn an HTTP status / message from a provider into a friendly AIError."""
+    if status in (401, 403) or any(
+        s in text for s in ("api key not valid", "invalid api key", "incorrect api key", "api_key_invalid")
+    ):
+        return AIError(
+            "invalid_api_key",
+            f"{label} rejected the API key. Check the key in your .env file, then restart the app.",
+            401,
+        )
+    if status == 429:
+        if any(s in text for s in ("quota", "billing", "insufficient", "exceeded")):
+            return AIError(
+                "quota_exceeded",
+                f"Your {label} quota or billing limit has been reached. Check your plan and billing, or try another model.",
+                429,
+            )
+        return AIError("rate_limited", f"{label} is receiving too many requests. Wait a moment and retry.", 429)
+    if status == 404 or (
+        "model" in text and any(s in text for s in ("not found", "does not exist", "not supported", "unknown model"))
+    ):
+        return AIError(
+            "unsupported_model",
+            f"{label} does not offer the selected model, or your account cannot use it. Choose another model in Settings.",
+            400,
+        )
+    if status is not None and status >= 500:
+        return AIError(
+            "service_unavailable",
+            f"{label} is temporarily unavailable. Please try again in a moment.",
+            503,
+        )
+    if status == 400:
+        return AIError(
+            "bad_request",
+            f"{label} could not process this request. Try shortening your message or starting a new chat.",
+            400,
+        )
+    return None
+
+
+def translate_ai_exception(provider, exc):
+    """Convert any SDK exception into a safe AIError (details go to the log only)."""
+    label = PROVIDERS[provider]["label"]
+    text = str(exc).lower()
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(exc, "code", None)
+    if not isinstance(status, int):
+        status = None
+    log.warning("AI call failed (%s): %s: %s", provider, type(exc).__name__, str(exc)[:300])
+
+    known = ai_error_from_status(label, status, text)
+    if known:
+        return known
+    name = type(exc).__name__.lower()
+    if "timeout" in name or "timed out" in text:
+        return AIError("timeout", f"{label} took too long to respond. Please try again.", 504)
+    if "connect" in name or "network" in name or isinstance(exc, (ConnectionError, OSError)) or "getaddrinfo" in text:
+        return AIError("network_error", f"Could not reach {label}. Check your internet connection and try again.", 503)
+    return AIError("ai_error", f"{label} returned an unexpected error. Please try again.", 502)
+
+
+def call_openai(api_key, model, history, test=False):
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise AIError("missing_package", "The 'openai' package is not installed. Run: python -m pip install openai", 500)
+    try:
+        client = OpenAI(api_key=api_key, timeout=AI_TIMEOUT_SECONDS, max_retries=1)
+        if test:
+            client.models.retrieve(model)
+            return ""
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+        resp = client.chat.completions.create(model=model, messages=messages)
+        text = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+    except Exception as exc:  # noqa: BLE001 - translated into a safe message
+        raise translate_ai_exception("openai", exc) from exc
+    if not text:
+        raise AIError("empty_response", "The model returned an empty answer. Please retry.", 502)
+    return text
+
+
+def call_gemini(api_key, model, history, test=False):
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise AIError(
+            "missing_package",
+            "The 'google-genai' package is not installed. Run: python -m pip install google-genai",
+            500,
+        )
+    try:
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=AI_TIMEOUT_SECONDS * 1000),
+        )
+        if test:
+            client.models.get(model=model)
+            return ""
+        # Gemini uses the role "model" for assistant messages; merge consecutive same-role turns.
+        merged = []
+        for m in history:
+            role = "user" if m["role"] == "user" else "model"
+            if merged and merged[-1][0] == role:
+                merged[-1][1] += "\n\n" + m["content"]
+            else:
+                merged.append([role, m["content"]])
+        contents = [types.Content(role=r, parts=[types.Part(text=t)]) for r, t in merged]
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        )
+        text = (resp.text or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        raise translate_ai_exception("gemini", exc) from exc
+    if not text:
+        raise AIError(
+            "empty_response",
+            "The model returned no text (the request may have been blocked by a safety filter). Try rephrasing.",
+            502,
+        )
+    return text
+
+
+def call_ai(provider, api_key, model, history, test=False):
+    if provider == "openai":
+        return call_openai(api_key, model, history, test)
+    if provider == "gemini":
+        return call_gemini(api_key, model, history, test)
+    raise AIError("unsupported_provider", "Unsupported AI provider.", 400)
+
+
+# ---------------------------------------------------------------------------
+# Request helpers
+# ---------------------------------------------------------------------------
+_inflight = set()
+_inflight_lock = threading.Lock()
+
+
+@contextmanager
+def conversation_busy(cid):
+    """Block duplicate submissions: only one AI request per conversation at a time."""
+    with _inflight_lock:
+        if cid in _inflight:
+            raise ApiError("busy", "A response is already being generated for this chat. Please wait.", 409)
+        _inflight.add(cid)
+    try:
+        yield
+    finally:
+        with _inflight_lock:
+            _inflight.discard(cid)
+
+
+def read_json():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        raise ApiError("invalid_json", "The request body must be valid JSON.", 400)
+    return data
+
+
+def require_conversation(conn, cid):
+    if not isinstance(cid, str) or not ID_RE.match(cid):
+        raise ApiError("invalid_conversation", "That conversation ID is not valid.", 400)
+    row = conn.execute(
+        "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?", (cid,)
+    ).fetchone()
+    if row is None:
+        raise ApiError("conversation_not_found", "That conversation no longer exists.", 404)
+    return row
+
+
+def clean_text(value):
+    """Collapse whitespace and drop control characters."""
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def make_title(text):
+    first_line = next((ln for ln in text.splitlines() if ln.strip()), "")
+    title = clean_text(first_line.replace("`", ""))
+    if not title:
+        return "New chat"
+    if len(title) > MAX_TITLE_CHARS:
+        title = title[: MAX_TITLE_CHARS - 1].rstrip() + "\u2026"
+    return title
+
+
+def like_pattern(term):
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return "%" + escaped + "%"
+
+
+def produce_reply(conn, cid, user_msg_id):
+    """Ask the AI to answer the user message `user_msg_id`, then save the reply.
+
+    Only recent messages are sent to the AI; the full history stays in SQLite.
+    Anything after the user message (an older reply) is replaced only if the
+    new request succeeds, so a failure never loses the previous answer.
+    """
+    provider, model = active_ai(conn)
+    label = PROVIDERS[provider]["label"]
+    api_key = get_api_key(provider)
+    if not api_key:
+        raise AIError(
+            "missing_api_key",
+            f"No {label} API key was found. Add {PROVIDERS[provider]['env_var']} to your .env file and restart the app.",
+            400,
+        )
+
+    rows = conn.execute(
+        "SELECT role, content FROM messages WHERE conversation_id = ? AND id <= ? ORDER BY id DESC LIMIT ?",
+        (cid, user_msg_id, CONTEXT_MAX_MESSAGES),
+    ).fetchall()
+    history, used = [], 0
+    for r in rows:  # newest first
+        size = len(r["content"])
+        if history and used + size > CONTEXT_MAX_CHARS:
+            break
+        history.append({"role": r["role"], "content": r["content"]})
+        used += size
+    history.reverse()
+    while history and history[0]["role"] != "user":
+        history.pop(0)
+
+    reply = call_ai(provider, api_key, model, history)
+
+    ts = now_iso()
+    try:
+        conn.execute("DELETE FROM messages WHERE conversation_id = ? AND id > ?", (cid, user_msg_id))
+        cur = conn.execute(
+            "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (cid, "assistant", reply, ts),
+        )
+        conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (ts, cid))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return {"id": cur.lastrowid, "role": "assistant", "content": reply, "created_at": ts}
+
+
+# ---------------------------------------------------------------------------
+# Error handlers, security headers
+# ---------------------------------------------------------------------------
+@app.errorhandler(ApiError)
+def handle_api_error(e):
+    body = {"error": {"code": e.code, "message": e.message}}
+    if e.retryable:
+        body["retryable"] = True
+    return jsonify(body), e.status
+
+
+@app.errorhandler(Exception)
+def handle_unexpected(e):
+    if isinstance(e, HTTPException):
+        texts = {
+            400: "Bad request.",
+            404: "Not found.",
+            405: "Method not allowed.",
+            413: "The request is too large.",
+        }
+        return jsonify(error={"code": "http_%d" % e.code, "message": texts.get(e.code, e.name)}), e.code
+    if isinstance(e, sqlite3.Error):
+        log.exception("Database error")
+        return jsonify(error={"code": "database_error", "message": "A database error occurred. Please try again."}), 500
+    log.exception("Unexpected server error")
+    return jsonify(error={"code": "server_error", "message": "Something went wrong on the server. Please try again."}), 500
+
+
+@app.before_request
+def guard_api_requests():
+    """Reject cross-site form posts: state-changing API calls need our custom header."""
+    if request.path.startswith("/api/") and request.method in ("POST", "PATCH", "PUT", "DELETE"):
+        if request.headers.get("X-CodeMind-Client") != "web":
+            raise ApiError("forbidden", "Request rejected.", 403)
+
+
+@app.after_request
+def add_security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+        "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    )
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.get("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+
+@app.get("/health")
+def health():
+    conn = get_db()
+    conn.execute("SELECT 1").fetchone()
+    return jsonify(status="ok", app=APP_NAME, version=APP_VERSION, database="ok", time=now_iso())
+
+
+@app.get("/api/conversations")
+def list_conversations():
+    conn = get_db()
+    q = clean_text(request.args.get("q", ""))[:100]
+    if q:
+        pat = like_pattern(q)
+        rows = conn.execute(
+            "SELECT c.id, c.title, c.created_at, c.updated_at FROM conversations c "
+            "WHERE c.title LIKE ? ESCAPE '\\' OR EXISTS ("
+            "  SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND m.content LIKE ? ESCAPE '\\') "
+            "ORDER BY c.updated_at DESC LIMIT 200",
+            (pat, pat),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 200"
+        ).fetchall()
+    return jsonify(conversations=[dict(r) for r in rows])
+
+
+@app.post("/api/conversations")
+def create_conversation():
+    conn = get_db()
+    cid, ts = uuid.uuid4().hex, now_iso()
+    try:
+        conn.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (cid, "New chat", ts, ts),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return jsonify(conversation=dict(require_conversation(conn, cid))), 201
+
+
+@app.get("/api/conversations/<cid>")
+def load_conversation(cid):
+    conn = get_db()
+    conv = require_conversation(conn, cid)
+    rows = conn.execute(
+        "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+        (cid,),
+    ).fetchall()
+    return jsonify(conversation=dict(conv), messages=[dict(r) for r in rows])
+
+
+@app.patch("/api/conversations/<cid>")
+def rename_conversation(cid):
+    conn = get_db()
+    require_conversation(conn, cid)
+    title = read_json().get("title")
+    if not isinstance(title, str) or not clean_text(title):
+        raise ApiError("invalid_title", "Please enter a title.", 400)
+    title = clean_text(title)
+    if len(title) > MAX_RENAME_CHARS:
+        raise ApiError("title_too_long", f"Titles can be at most {MAX_RENAME_CHARS} characters.", 400)
+    try:
+        conn.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, cid))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return jsonify(conversation=dict(require_conversation(conn, cid)))
+
+
+@app.delete("/api/conversations/<cid>")
+def delete_conversation(cid):
+    conn = get_db()
+    require_conversation(conn, cid)
+    try:
+        conn.execute("DELETE FROM conversations WHERE id = ?", (cid,))  # messages cascade
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return jsonify(deleted=True)
+
+
+@app.post("/api/conversations/<cid>/clear")
+def clear_conversation(cid):
+    conn = get_db()
+    require_conversation(conn, cid)
+    with conversation_busy(cid):
+        try:
+            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (cid,))
+            conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now_iso(), cid))
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+    return jsonify(cleared=True)
+
+
+@app.post("/api/history/clear")
+def clear_all_history():
+    conn = get_db()
+    if read_json().get("confirm") is not True:
+        raise ApiError("confirmation_required", "Confirmation is required to delete all conversations.", 400)
+    try:
+        conn.execute("DELETE FROM conversations")  # messages cascade
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return jsonify(cleared=True)
+
+
+@app.post("/api/conversations/<cid>/messages")
+def send_message(cid):
+    data = read_json()
+    content = data.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ApiError("empty_message", "Type a message before sending.", 400)
+    content = content.strip()
+    if len(content) > MAX_MESSAGE_CHARS:
+        raise ApiError("message_too_long", f"Messages can be at most {MAX_MESSAGE_CHARS} characters.", 400)
+
+    conn = get_db()
+    require_conversation(conn, cid)
+    with conversation_busy(cid):
+        ts = now_iso()
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (cid,)
+            ).fetchone()[0]
+            cur = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                (cid, "user", content, ts),
+            )
+            user_id = cur.lastrowid
+            if count == 0:  # the first message names the conversation
+                conn.execute(
+                    "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                    (make_title(content), ts, cid),
+                )
+            else:
+                conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (ts, cid))
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+        assistant = produce_reply(conn, cid, user_id)
+
+    conv = require_conversation(conn, cid)
+    return (
+        jsonify(
+            user_message={"id": user_id, "role": "user", "content": content, "created_at": ts},
+            assistant_message=assistant,
+            conversation=dict(conv),
+        ),
+        201,
+    )
+
+
+@app.post("/api/conversations/<cid>/regenerate")
+def regenerate(cid):
+    """Answer the last user message again (also used by the Retry button)."""
+    conn = get_db()
+    require_conversation(conn, cid)
+    with conversation_busy(cid):
+        row = conn.execute(
+            "SELECT id FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1",
+            (cid,),
+        ).fetchone()
+        if row is None:
+            raise ApiError("nothing_to_regenerate", "There is no message to answer yet.", 400)
+        assistant = produce_reply(conn, cid, row["id"])
+    return jsonify(assistant_message=assistant, conversation=dict(require_conversation(conn, cid)))
+
+
+@app.get("/api/settings")
+def get_settings():
+    return jsonify(settings_payload(get_db()))
+
+
+@app.post("/api/settings")
+def update_settings():
+    conn = get_db()
+    data = read_json()
+    provider = data.get("provider")
+    model = data.get("model")
+    theme = data.get("theme")
+    try:
+        if provider is not None:
+            if provider not in PROVIDERS:
+                raise ApiError("unsupported_provider", "That AI provider is not supported.", 400)
+            set_setting(conn, "provider", provider)
+        else:
+            provider = active_ai(conn)[0]
+        if model is not None:
+            if not isinstance(model, str) or model not in models_for(provider):
+                raise ApiError("unsupported_model", "That model is not supported for the selected provider.", 400)
+            set_setting(conn, "model_" + provider, model)
+        if theme is not None:
+            if theme not in ("light", "dark"):
+                raise ApiError("invalid_theme", "Theme must be light or dark.", 400)
+            set_setting(conn, "theme", theme)
+        conn.commit()
+    except ApiError:
+        conn.rollback()
+        raise
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return jsonify(settings_payload(conn))
+
+
+@app.post("/api/status/test")
+def test_connection():
+    """Check that the API key and selected model work (a tiny, cheap request)."""
+    conn = get_db()
+    provider, model = active_ai(conn)
+    label = PROVIDERS[provider]["label"]
+    api_key = get_api_key(provider)
+    if not api_key:
+        raise ApiError(
+            "missing_api_key",
+            f"No {label} API key was found. Add {PROVIDERS[provider]['env_var']} to your .env file and restart the app.",
+            400,
+        )
+    call_ai(provider, api_key, model, [], test=True)
+    return jsonify(ok=True, message=f"Connected to {label}. Model {model} is available.")
+
+
+# ---------------------------------------------------------------------------
+# Frontend (HTML + CSS + JavaScript). Wrapped in {% raw %} so Jinja leaves it alone.
+# ---------------------------------------------------------------------------
+HTML_PAGE = r"""{% raw %}<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CodeMind AI - Your Intelligent AI Coding Companion</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
+<link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" disabled>
+<script>
+/* Apply the saved theme immediately to avoid a flash. */
+try{var t=localStorage.getItem('cm-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}
+</script>
+<style>
+/* ======================= CSS: design tokens ======================= */
+:root{
+  color-scheme:light;
+  --font-ui:'Manrope',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;
+  --font-code:'JetBrains Mono',ui-monospace,'Cascadia Code',Consolas,'Courier New',monospace;
+  --side-bg:#0f1a2b; --side-fg:#d7e0ee; --side-muted:#8da0ba; --side-hover:#182841; --side-active:#20385a; --side-line:#233450;
+  --accent:#0a766e; --accent-ink:#0a766e; --accent-soft:#dcf3f0; --on-accent:#ffffff;
+  --bg:#f3f6f9; --panel:#ffffff; --ink:#142033; --ink-2:#4a5a72; --line:#dbe3ec;
+  --user-bg:#0a766e; --user-fg:#ffffff;
+  --code-bg:#f6f8fa; --code-head:#e8edf3; --inline-code:#e9eef4;
+  --danger:#b42318; --danger-soft:#fdecea; --ok:#15803d;
+  --shadow:0 1px 2px rgba(15,26,43,.06),0 10px 28px rgba(15,26,43,.07);
+}
+[data-theme="dark"]{
+  color-scheme:dark;
+  --side-bg:#0a1220; --side-hover:#13203a; --side-active:#1a3052; --side-line:#1c2c47;
+  --accent:#3dd6c3; --accent-ink:#5fe3d2; --accent-soft:#0f3430; --on-accent:#05201c;
+  --bg:#0c1421; --panel:#121d2f; --ink:#e7eef8; --ink-2:#a0b1c8; --line:#243650;
+  --user-bg:#145a54; --user-fg:#eafffb;
+  --code-bg:#0d1117; --code-head:#171e29; --inline-code:#1c2a40;
+  --danger:#ff8a80; --danger-soft:#3a1a1a; --ok:#4ade80;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px rgba(0,0,0,.35);
+}
+
+/* ======================= CSS: base ======================= */
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%;margin:0}
+body{font-family:var(--font-ui);font-size:15px;line-height:1.6;background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.ico{width:18px;height:18px;flex:none}
+.app{display:flex;height:100vh;height:100dvh;overflow:hidden}
+
+/* ======================= CSS: sidebar ======================= */
+.sidebar{width:288px;flex:none;background:var(--side-bg);color:var(--side-fg);display:flex;flex-direction:column;padding:16px 12px 12px;gap:12px;z-index:30;transition:transform .25s ease}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 6px 2px}
+.brand-name{font-weight:800;font-size:18px;letter-spacing:-.01em;color:#fff}
+.logo{width:34px;height:34px;flex:none}
+.btn-new{display:flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:12px;padding:11px 14px;background:var(--accent);color:var(--on-accent);font-weight:700;transition:filter .15s,transform .15s}
+.btn-new:hover{filter:brightness(1.1)}
+.btn-new:active{transform:scale(.98)}
+.search{display:flex;align-items:center;gap:8px;background:var(--side-hover);border:1px solid var(--side-line);border-radius:10px;padding:0 10px;color:var(--side-muted)}
+.search input{flex:1;min-width:0;background:transparent;border:0;outline:0;padding:9px 0;color:var(--side-fg)}
+.search input::placeholder{color:var(--side-muted)}
+.search:focus-within{border-color:var(--accent)}
+.history{flex:1;overflow-y:auto;margin:0 -4px;padding:0 4px;display:flex;flex-direction:column;gap:2px}
+.history-empty{color:var(--side-muted);font-size:13px;padding:14px 8px}
+.hitem{display:flex;align-items:center;border-radius:10px;transition:background .15s}
+.hitem:hover,.hitem:focus-within{background:var(--side-hover)}
+.hitem.active{background:var(--side-active)}
+.hmain{flex:1;min-width:0;text-align:left;background:none;border:0;padding:9px 10px;color:var(--side-fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-radius:10px;font-size:14px}
+.hacts{display:flex;opacity:0;transition:opacity .15s;padding-right:4px}
+.hitem:hover .hacts,.hitem:focus-within .hacts{opacity:1}
+.hacts button{background:none;border:0;color:var(--side-muted);padding:6px;border-radius:8px;display:grid;place-items:center}
+.hacts button:hover{color:#fff;background:var(--side-line)}
+.hacts button.del:hover{color:#ff8a80}
+.side-foot{display:flex;gap:8px;border-top:1px solid var(--side-line);padding-top:12px}
+.side-foot button{flex:1;display:flex;align-items:center;justify-content:center;gap:8px;background:var(--side-hover);border:1px solid var(--side-line);border-radius:10px;padding:9px 8px;color:var(--side-fg);font-size:13.5px;font-weight:600;transition:background .15s}
+.side-foot button:hover{background:var(--side-active)}
+.scrim{display:none}
+
+/* ======================= CSS: main area ======================= */
+.main{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg)}
+.topbar{display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--panel);min-height:58px}
+.top-title{flex:1;min-width:0;font-weight:700;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.icon-btn{background:none;border:1px solid var(--line);border-radius:10px;padding:7px;display:none;place-items:center;color:var(--ink)}
+.badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--bg);border-radius:999px;padding:5px 12px;font-size:12.5px;font-weight:600;color:var(--ink-2);max-width:240px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge:hover{border-color:var(--accent)}
+.btn-ghost{display:inline-flex;align-items:center;gap:6px;background:none;border:1px solid var(--line);border-radius:10px;padding:6px 12px;font-size:13.5px;font-weight:600;color:var(--ink-2);transition:background .15s,color .15s}
+.btn-ghost:hover{background:var(--bg);color:var(--ink)}
+.banner{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 18px;background:var(--danger-soft);color:var(--danger);border-bottom:1px solid var(--line);font-size:14px;font-weight:600}
+.banner button{background:none;border:1px solid currentColor;color:inherit;border-radius:8px;padding:3px 10px;font-weight:700}
+.scroller{flex:1;overflow-y:auto;scroll-behavior:smooth}
+.thread{max-width:820px;margin:0 auto;padding:12px 20px 28px}
+
+/* ======================= CSS: welcome screen ======================= */
+.welcome{padding:6vh 0 0;text-align:center}
+.welcome .logo{width:64px;height:64px;margin-bottom:14px}
+.welcome h2{margin:0;font-size:clamp(30px,5vw,44px);font-weight:800;letter-spacing:-.025em;line-height:1.1}
+.welcome .tagline{margin:10px 0 6px;font-size:18px;color:var(--ink-2);font-weight:500}
+.welcome .lead{margin:0 auto 28px;max-width:520px;color:var(--ink-2)}
+.prompts{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;text-align:left}
+.prompt{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;display:flex;flex-direction:column;gap:4px;transition:border-color .15s,box-shadow .15s}
+.prompt:hover{border-color:var(--accent);box-shadow:var(--shadow)}
+.prompt .tag{font-size:12.5px;font-weight:700;color:var(--accent-ink)}
+.prompt .txt{font-size:14.5px;color:var(--ink)}
+
+/* ======================= CSS: messages ======================= */
+.msg{display:flex;gap:12px;margin:20px 0;align-items:flex-start}
+.msg.user{justify-content:flex-end}
+.avatar{flex:none;width:34px;height:34px;border-radius:10px;background:var(--accent);color:var(--on-accent);display:grid;place-items:center}
+.avatar svg{width:20px;height:20px}
+.msgbody{min-width:0}
+.msg.assistant .msgbody{flex:1}
+.msg.user .msgbody{max-width:86%}
+.bubble{border-radius:18px;padding:12px 18px;overflow-wrap:anywhere}
+.msg.user .bubble{background:var(--user-bg);color:var(--user-fg);border-bottom-right-radius:5px;white-space:pre-wrap}
+.msg.assistant .bubble{background:var(--panel);border:1px solid var(--line);border-top-left-radius:5px;box-shadow:var(--shadow)}
+.msg.error .bubble{background:var(--danger-soft);border-color:var(--danger);color:var(--danger);font-weight:600}
+.msg.error .avatar{background:var(--danger);color:#fff}
+.msg-actions{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;background:none;border:1px solid var(--line);border-radius:8px;padding:4px 10px;font-size:13px;font-weight:600;color:var(--ink-2);transition:background .15s,color .15s}
+.chip:hover{background:var(--panel);color:var(--ink)}
+.chip:disabled{opacity:.5;cursor:not-allowed}
+.chip .ico{width:15px;height:15px}
+.typing{display:inline-flex;gap:5px;padding:6px 2px;align-items:center}
+.typing span{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:blink 1.2s infinite ease-in-out}
+.typing span:nth-child(2){animation-delay:.18s}
+.typing span:nth-child(3){animation-delay:.36s}
+@keyframes blink{0%,80%,100%{opacity:.25;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
+
+/* ======================= CSS: rendered Markdown ======================= */
+.md{line-height:1.65}
+.md>:first-child{margin-top:0}
+.md>:last-child{margin-bottom:0}
+.md p{margin:.7em 0}
+.md h1,.md h2,.md h3,.md h4{line-height:1.25;margin:1.2em 0 .5em;letter-spacing:-.01em}
+.md h1{font-size:1.45em}.md h2{font-size:1.28em}.md h3{font-size:1.12em}.md h4{font-size:1em}
+.md ul,.md ol{padding-left:1.5em;margin:.6em 0}
+.md li{margin:.25em 0}
+.md a{color:var(--accent-ink);text-decoration:underline;text-underline-offset:2px}
+.md blockquote{margin:.8em 0;padding:.2em 1em;border-left:3px solid var(--accent);color:var(--ink-2)}
+.md hr{border:0;border-top:1px solid var(--line);margin:1.2em 0}
+.md :not(pre)>code{background:var(--inline-code);padding:.12em .4em;border-radius:6px;font-family:var(--font-code);font-size:.88em}
+.tablewrap{overflow-x:auto;margin:.8em 0;border:1px solid var(--line);border-radius:10px}
+.md table{border-collapse:collapse;width:100%;font-size:14px}
+.md th,.md td{padding:8px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.md th{background:var(--code-head);font-weight:700}
+.md tr:last-child td{border-bottom:0}
+.codeblock{margin:.9em 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--code-bg)}
+.codehead{display:flex;align-items:center;justify-content:space-between;gap:8px;background:var(--code-head);padding:6px 8px 6px 14px;font-family:var(--font-code);font-size:12.5px;color:var(--ink-2)}
+.copybtn{display:inline-flex;align-items:center;gap:6px;background:none;border:1px solid var(--line);border-radius:7px;padding:3px 9px;font-size:12.5px;font-weight:600;color:var(--ink-2)}
+.copybtn:hover{background:var(--panel);color:var(--ink)}
+.copybtn .ico{width:14px;height:14px}
+.codeblock pre{margin:0;padding:14px 16px;overflow-x:auto;font-family:var(--font-code);font-size:13px;line-height:1.55;tab-size:4;white-space:pre}
+.codeblock pre code{font-family:inherit;background:none;padding:0;color:var(--ink)}
+.codeblock pre code.hljs{padding:0;background:transparent}
+
+/* ======================= CSS: composer ======================= */
+.composer-wrap{padding:8px 18px calc(10px + env(safe-area-inset-bottom,0px));background:linear-gradient(to top,var(--bg) 70%,transparent)}
+.composer{max-width:820px;margin:0 auto;display:flex;align-items:flex-end;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:8px 8px 8px 16px;box-shadow:var(--shadow);transition:border-color .15s}
+.composer:focus-within{border-color:var(--accent)}
+.composer textarea{flex:1;min-width:0;resize:none;border:0;outline:0;background:transparent;padding:8px 0;max-height:200px;line-height:1.5}
+.composer textarea::placeholder{color:var(--ink-2)}
+.send{flex:none;width:40px;height:40px;border-radius:12px;border:0;background:var(--accent);color:var(--on-accent);display:grid;place-items:center;transition:filter .15s,transform .15s}
+.send:hover:not(:disabled){filter:brightness(1.1)}
+.send:active:not(:disabled){transform:scale(.94)}
+.send:disabled{opacity:.4;cursor:not-allowed}
+.hint{max-width:820px;margin:6px auto 0;font-size:12px;color:var(--ink-2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+
+/* ======================= CSS: modals, toasts ======================= */
+.modal{position:fixed;inset:0;background:rgba(6,12,22,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:60}
+.card{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:18px;width:100%;max-width:440px;max-height:calc(100dvh - 32px);overflow-y:auto;padding:22px;box-shadow:var(--shadow)}
+.card.wide{max-width:560px}
+.card h2{margin:0 0 6px;font-size:19px}
+.card h3{margin:22px 0 8px;font-size:14.5px}
+.card p{margin:6px 0;color:var(--ink-2);font-size:14px}
+.field{display:flex;flex-direction:column;gap:6px;margin:12px 0}
+.field label{font-weight:600;font-size:13.5px}
+.field select,.card input[type=text]{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:9px 12px}
+.card input[type=text]{margin-top:10px}
+.row{display:flex;gap:10px;justify-content:flex-end;margin-top:18px;flex-wrap:wrap}
+.btn{border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:8px 16px;font-weight:700}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+.btn.danger{background:var(--danger);color:#fff;border-color:var(--danger)}
+.btn:disabled{opacity:.6;cursor:wait}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.seg button{background:var(--bg);border:0;padding:7px 16px;font-weight:600;color:var(--ink-2)}
+.seg button[aria-pressed="true"]{background:var(--accent);color:var(--on-accent)}
+.status{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--danger)}
+.dot.ok{background:var(--ok)}
+.testmsg{font-size:13.5px;margin-top:8px;font-weight:600}
+.testmsg.ok{color:var(--ok)}
+.testmsg.err{color:var(--danger)}
+.toasts{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;z-index:80;width:min(92vw,420px)}
+.toast{background:var(--ink);color:var(--bg);border-radius:12px;padding:10px 16px;font-size:14px;font-weight:600;box-shadow:var(--shadow)}
+.toast.error{background:var(--danger);color:#fff}
+
+/* ======================= CSS: responsive ======================= */
+@media (max-width:860px){
+  .sidebar{position:fixed;top:0;bottom:0;left:0;transform:translateX(-100%);width:min(310px,86vw)}
+  .sidebar.open{transform:none}
+  .scrim.show{display:block;position:fixed;inset:0;background:rgba(6,12,22,.5);z-index:25}
+  .icon-btn{display:grid}
+  .topbar{padding:8px 12px}
+  .btn-ghost span{display:none}
+  .badge{max-width:130px}
+  .thread{padding:8px 14px 22px}
+  .msg.user .msgbody{max-width:92%}
+  .composer-wrap{padding:6px 10px calc(8px + env(safe-area-inset-bottom,0px))}
+}
+@media (hover:none){.hacts{opacity:1}}
+@media (max-width:480px){.avatar{display:none}.hint .keys{display:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<noscript><p style="padding:24px">CodeMind AI needs JavaScript. Please enable it in your browser.</p></noscript>
+
+<div class="app">
+  <!-- ===== Sidebar ===== -->
+  <aside class="sidebar" id="sidebar" aria-label="Conversations">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 40 40" aria-hidden="true"><rect width="40" height="40" rx="11" fill="#0a766e"/><path d="M15 13l-7 7 7 7M25 13l7 7-7 7" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="20" r="2.6" fill="#7ff0df"/></svg>
+      <span class="brand-name">CodeMind AI</span>
+    </div>
+    <button class="btn-new" id="newChat" type="button" data-icon="plus"><span>New chat</span></button>
+    <label class="search" data-icon="search">
+      <input id="search" type="search" placeholder="Search conversations" autocomplete="off" aria-label="Search conversations">
+    </label>
+    <nav class="history" id="history" aria-label="Chat history"></nav>
+    <div class="side-foot">
+      <button id="themeBtn" type="button"><span class="lbl"></span></button>
+      <button id="settingsBtn" type="button" data-icon="sliders"><span>Settings</span></button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ===== Main ===== -->
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="menuBtn" type="button" aria-label="Open menu" data-icon="menu"></button>
+      <div class="top-title" id="topTitle">New chat</div>
+      <button class="badge" id="modelBadge" type="button" title="Change AI provider or model">AI</button>
+      <button class="btn-ghost" id="clearBtn" type="button" data-icon="eraser" hidden><span>Clear conversation</span></button>
+    </header>
+    <div class="banner" id="banner" hidden></div>
+    <div class="scroller" id="scroller">
+      <div class="thread" id="thread" aria-live="polite"></div>
+    </div>
+    <footer class="composer-wrap">
+      <div class="composer">
+        <textarea id="input" rows="1" maxlength="8000" placeholder="Ask about code, errors, algorithms..." aria-label="Message"></textarea>
+        <button class="send" id="sendBtn" type="button" aria-label="Send message" data-icon="arrowup" disabled></button>
+      </div>
+      <div class="hint"><span class="keys">Enter to send. Shift+Enter for a new line.</span><span id="counter"></span><span>CodeMind can make mistakes. Test important code.</span></div>
+    </footer>
+  </main>
+</div>
+
+<!-- ===== Dialog (rename / confirm) ===== -->
+<div class="modal" id="dialog" hidden>
+  <div class="card" role="dialog" aria-modal="true" aria-labelledby="dlgTitle">
+    <h2 id="dlgTitle"></h2>
+    <p id="dlgMsg"></p>
+    <input type="text" id="dlgInput" maxlength="80" aria-label="Conversation title">
+    <div class="row"><button class="btn" id="dlgCancel" type="button">Cancel</button><button class="btn primary" id="dlgOk" type="button">OK</button></div>
+  </div>
+</div>
+
+<!-- ===== Settings ===== -->
+<div class="modal" id="settings" hidden>
+  <div class="card wide" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+    <h2 id="setTitle">Settings</h2>
+    <div class="field"><label for="setProvider">AI provider</label><select id="setProvider"></select></div>
+    <div class="field"><label for="setModel">Model</label><select id="setModel"></select></div>
+    <div class="field"><label>Theme</label>
+      <div class="seg" role="group" aria-label="Theme"><button type="button" id="themeLight" aria-pressed="true">Light</button><button type="button" id="themeDark" aria-pressed="false">Dark</button></div>
+    </div>
+    <h3>API connection</h3>
+    <div class="status"><span class="dot" id="keyDot"></span><span id="keyText"></span></div>
+    <p id="keyHelp"></p>
+    <div class="row" style="justify-content:flex-start;margin-top:10px"><button class="btn" id="testBtn" type="button">Test connection</button></div>
+    <div class="testmsg" id="testMsg" role="status"></div>
+    <h3>Conversation history</h3>
+    <p>Delete every saved conversation from the database. This cannot be undone.</p>
+    <div class="row" style="justify-content:flex-start;margin-top:8px"><button class="btn danger" id="wipeBtn" type="button">Delete all conversations</button></div>
+    <h3>About</h3>
+    <p id="aboutText"></p>
+    <p>API keys are read from environment variables on your computer and never shown in full. This local app has no login, so use it only on a computer you trust.</p>
+    <div class="row"><button class="btn primary" id="settingsClose" type="button">Done</button></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<!-- Libraries (CDN). If any fail to load, the built-in fallback renderer is used. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+
+<script>
+/* ======================= JavaScript ======================= */
+(function(){
+'use strict';
+
+var MAX_CHARS = 8000;
+var PROMPTS = [
+  {tag:'Python', text:'Write a Python program to check whether a number is prime.'},
+  {tag:'Java', text:'Debug my Java code.'},
+  {tag:'JavaScript', text:'Explain JavaScript promises.'},
+  {tag:'HTML and CSS', text:'Create a responsive login page using HTML and CSS.'},
+  {tag:'Fundamentals', text:'Explain data structures with examples.'},
+  {tag:'Careers', text:'Help me prepare for coding interviews.'}
+];
+
+var state = {convId:null, title:'', messages:[], convs:[], busy:false, error:null, settings:null};
+
+var $ = function(sel, root){ return (root||document).querySelector(sel); };
+
+/* ---------- icons ---------- */
+var ICONS = {
+  plus:'<path d="M12 5v14M5 12h14"/>',
+  search:'<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  pencil:'<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+  trash:'<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>',
+  sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>',
+  sliders:'<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+  copy:'<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>',
+  refresh:'<path d="M20 11a8 8 0 0 0-14.5-4M4 4v4h4"/><path d="M4 13a8 8 0 0 0 14.5 4M20 20v-4h-4"/>',
+  menu:'<path d="M4 6h16M4 12h16M4 18h16"/>',
+  arrowup:'<path d="M12 19V5M6 11l6-6 6 6"/>',
+  eraser:'<path d="M20 20H9l-5-5a2 2 0 0 1 0-2.8l8.2-8.2a2 2 0 0 1 2.8 0l5 5a2 2 0 0 1 0 2.8L12 20"/>',
+  alert:'<circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16.5v.5"/>',
+  bot:'<path d="M9 8l-4 4 4 4M15 8l4 4-4 4"/>'
+};
+function icon(name){
+  return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (ICONS[name]||'') + '</svg>';
+}
+
+/* ---------- small helpers ---------- */
+function escapeHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function el(tag, cls){
+  var n = document.createElement(tag);
+  if(cls){ n.className = cls; }
+  return n;
+}
+function toast(msg, kind){
+  var t = el('div', 'toast ' + (kind||''));
+  t.textContent = msg;
+  $('#toasts').appendChild(t);
+  setTimeout(function(){ t.remove(); }, 3800);
+}
+
+/* ---------- API helper ---------- */
+async function api(path, opts){
+  opts = opts || {};
+  var init = {method: opts.method || 'GET', headers: {'X-CodeMind-Client':'web'}};
+  if(opts.body !== undefined){
+    init.headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(opts.body);
+  }
+  var res;
+  try{
+    res = await fetch(path, init);
+  }catch(e){
+    throw {code:'network_error', status:0, retryable:false, message:'Cannot reach the CodeMind server. Make sure app.py is still running.'};
+  }
+  var data = null;
+  try{ data = await res.json(); }catch(e){}
+  if(!res.ok){
+    var err = (data && data.error) || {};
+    throw {code: err.code || 'error', status: res.status, retryable: !!(data && data.retryable),
+           message: err.message || 'Something went wrong. Please try again.'};
+  }
+  return data;
+}
+
+/* ---------- clipboard ---------- */
+async function copyText(text, btn){
+  var ok = false;
+  try{
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  }catch(e){
+    try{
+      var ta = el('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      ok = document.execCommand('copy'); ta.remove();
+    }catch(e2){ ok = false; }
+  }
+  var span = btn && btn.querySelector('span');
+  if(span){
+    var old = span.textContent;
+    span.textContent = ok ? 'Copied' : 'Copy failed';
+    setTimeout(function(){ span.textContent = old; }, 1600);
+  }else{
+    toast(ok ? 'Copied to clipboard' : 'Could not copy', ok ? '' : 'error');
+  }
+}
+
+/* ---------- Markdown rendering (safe) ---------- */
+function fallbackMarkdown(text){
+  /* Used only if the CDN libraries failed to load. Everything is escaped. */
+  var parts = String(text).split('```');
+  var out = '';
+  parts.forEach(function(part, i){
+    if(i % 2 === 1){
+      var nl = part.indexOf('\n'), lang = '', body = part;
+      if(nl !== -1){ lang = part.slice(0, nl).trim(); body = part.slice(nl + 1); }
+      var cls = /^[\w+#-]+$/.test(lang) ? ' class="language-' + lang + '"' : '';
+      out += '<pre><code' + cls + '>' + escapeHtml(body.replace(/\n$/, '')) + '</code></pre>';
+    }else if(part.trim()){
+      out += '<p>' + escapeHtml(part.trim())
+        .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n/g, '<br>') + '</p>';
+    }
+  });
+  return out;
+}
+
+function enhanceCode(root){
+  root.querySelectorAll('pre').forEach(function(pre){
+    var code = pre.querySelector('code');
+    if(!code){ return; }
+    var m = (code.className || '').match(/language-([\w+#.-]+)/);
+    var lang = m ? m[1] : '';
+    if(window.hljs){
+      try{
+        if(!lang || hljs.getLanguage(lang)){ hljs.highlightElement(code); }
+      }catch(e){}
+    }
+    var wrap = el('div', 'codeblock');
+    var head = el('div', 'codehead');
+    var label = el('span'); label.textContent = lang || 'code';
+    var btn = el('button', 'copybtn'); btn.type = 'button';
+    btn.innerHTML = icon('copy') + '<span>Copy code</span>';
+    btn.addEventListener('click', function(){ copyText(code.textContent, btn); });
+    head.appendChild(label); head.appendChild(btn);
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(head); wrap.appendChild(pre);
+  });
+}
+
+function renderMarkdown(text){
+  var html = null;
+  if(window.marked && window.DOMPurify){
+    try{
+      html = DOMPurify.sanitize(marked.parse(String(text), {gfm:true, breaks:false}));
+    }catch(e){ html = null; }
+  }
+  if(html === null){ html = fallbackMarkdown(text); }
+  var box = el('div', 'md');
+  box.innerHTML = html;
+  box.querySelectorAll('a').forEach(function(a){ a.target = '_blank'; a.rel = 'noopener noreferrer'; });
+  box.querySelectorAll('table').forEach(function(tb){
+    var w = el('div', 'tablewrap'); tb.parentNode.insertBefore(w, tb); w.appendChild(tb);
+  });
+  enhanceCode(box);
+  return box;
+}
+
+/* ---------- building message elements ---------- */
+function avatarEl(kind){
+  var a = el('div', 'avatar');
+  a.innerHTML = icon(kind === 'error' ? 'alert' : 'bot');
+  return a;
+}
+function messageEl(m, isLast){
+  var row = el('div', 'msg ' + m.role);
+  var body = el('div', 'msgbody');
+  var bubble = el('div', 'bubble');
+  if(m.role === 'user'){
+    bubble.textContent = m.content;           /* plain text: never interpreted as HTML */
+    body.appendChild(bubble);
+  }else{
+    row.appendChild(avatarEl());
+    bubble.appendChild(renderMarkdown(m.content));
+    body.appendChild(bubble);
+    var acts = el('div', 'msg-actions');
+    var cp = el('button', 'chip'); cp.type = 'button';
+    cp.innerHTML = icon('copy') + '<span>Copy</span>';
+    cp.addEventListener('click', function(){ copyText(m.content, cp); });
+    acts.appendChild(cp);
+    if(isLast){
+      var rg = el('button', 'chip'); rg.type = 'button';
+      rg.innerHTML = icon('refresh') + '<span>Regenerate</span>';
+      rg.disabled = state.busy;
+      rg.addEventListener('click', regenerate);
+      acts.appendChild(rg);
+    }
+    body.appendChild(acts);
+  }
+  row.appendChild(body);
+  return row;
+}
+function typingEl(){
+  var row = el('div', 'msg assistant');
+  row.appendChild(avatarEl());
+  var body = el('div', 'msgbody');
+  var bubble = el('div', 'bubble');
+  bubble.setAttribute('aria-label', 'CodeMind is thinking');
+  bubble.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+  body.appendChild(bubble); row.appendChild(body);
+  return row;
+}
+function errorEl(err){
+  var row = el('div', 'msg assistant error');
+  row.appendChild(avatarEl('error'));
+  var body = el('div', 'msgbody');
+  var bubble = el('div', 'bubble');
+  bubble.setAttribute('role', 'alert');
+  bubble.textContent = err.message;
+  body.appendChild(bubble);
+  var acts = el('div', 'msg-actions');
+  if(err.retryable && state.convId){
+    var retry = el('button', 'chip'); retry.type = 'button';
+    retry.innerHTML = icon('refresh') + '<span>Retry</span>';
+    retry.addEventListener('click', regenerate);
+    acts.appendChild(retry);
+  }
+  var dismiss = el('button', 'chip'); dismiss.type = 'button';
+  dismiss.innerHTML = '<span>Dismiss</span>';
+  dismiss.addEventListener('click', function(){ state.error = null; renderMessages(); });
+  acts.appendChild(dismiss);
+  body.appendChild(acts); row.appendChild(body);
+  return row;
+}
+function welcomeEl(){
+  var w = el('div', 'welcome');
+  w.innerHTML =
+    '<svg class="logo" viewBox="0 0 40 40" aria-hidden="true"><rect width="40" height="40" rx="11" fill="#0a766e"/><path d="M15 13l-7 7 7 7M25 13l7 7-7 7" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="20" r="2.6" fill="#7ff0df"/></svg>' +
+    '<h2>CodeMind AI</h2>' +
+    '<p class="tagline">Your Intelligent AI Coding Companion</p>' +
+    '<p class="lead">Ask a programming question, paste code that is not working, or pick a starting point below.</p>';
+  var grid = el('div', 'prompts');
+  PROMPTS.forEach(function(p){
+    var b = el('button', 'prompt'); b.type = 'button';
+    var tag = el('span', 'tag'); tag.textContent = p.tag;
+    var txt = el('span', 'txt'); txt.textContent = p.text;
+    b.appendChild(tag); b.appendChild(txt);
+    b.addEventListener('click', function(){ sendMessage(p.text); });
+    grid.appendChild(b);
+  });
+  w.appendChild(grid);
+  return w;
+}
+
+function scrollToBottom(){
+  var s = $('#scroller');
+  requestAnimationFrame(function(){ s.scrollTop = s.scrollHeight; });
+}
+function renderMessages(){
+  var thread = $('#thread');
+  thread.textContent = '';
+  $('#clearBtn').hidden = !(state.convId && state.messages.length);
+  if(!state.messages.length && !state.busy && !state.error){
+    thread.appendChild(welcomeEl());
+    $('#scroller').scrollTop = 0;
+    return;
+  }
+  state.messages.forEach(function(m, i){
+    thread.appendChild(messageEl(m, i === state.messages.length - 1));
+  });
+  if(state.busy){ thread.appendChild(typingEl()); }
+  if(state.error){ thread.appendChild(errorEl(state.error)); }
+  scrollToBottom();
+}
+
+/* ---------- top bar, composer, banner ---------- */
+function updateTopbar(){
+  $('#topTitle').textContent = state.convId ? (state.title || 'New chat') : 'New chat';
+}
+function updateComposer(){
+  var input = $('#input');
+  var len = input.value.length;
+  $('#sendBtn').disabled = state.busy || !input.value.trim();
+  $('#counter').textContent = len > MAX_CHARS * 0.8 ? len + ' / ' + MAX_CHARS : '';
+}
+function autosize(){
+  var t = $('#input');
+  t.style.height = 'auto';
+  t.style.height = Math.min(t.scrollHeight, 200) + 'px';
+}
+function setBusy(v){
+  state.busy = v;
+  updateComposer();
+}
+function currentProvider(){
+  var s = state.settings;
+  if(!s){ return null; }
+  for(var i = 0; i < s.providers.length; i++){
+    if(s.providers[i].id === s.provider){ return s.providers[i]; }
+  }
+  return null;
+}
+function updateModelBadge(){
+  var s = state.settings, p = currentProvider();
+  $('#modelBadge').textContent = (s && p) ? p.label + ': ' + s.model : 'AI';
+}
+function updateBanner(){
+  var b = $('#banner'), p = currentProvider();
+  if(p && !p.configured){
+    b.hidden = false;
+    b.textContent = '';
+    var span = el('span');
+    span.textContent = 'No ' + p.label + ' API key found. Add ' + p.env_var + ' to your .env file and restart the app.';
+    var btn = el('button'); btn.type = 'button'; btn.textContent = 'Open settings';
+    btn.addEventListener('click', openSettings);
+    b.appendChild(span); b.appendChild(btn);
+  }else{
+    b.hidden = true;
+  }
+}
+
+/* ---------- history list ---------- */
+function renderHistory(){
+  var box = $('#history');
+  box.textContent = '';
+  if(!state.convs.length){
+    var empty = el('div', 'history-empty');
+    empty.textContent = $('#search').value.trim() ? 'No conversations match your search.' : 'No conversations yet. Start a new chat.';
+    box.appendChild(empty);
+    return;
+  }
+  state.convs.forEach(function(c){
+    var item = el('div', 'hitem' + (c.id === state.convId ? ' active' : ''));
+    var main = el('button', 'hmain'); main.type = 'button';
+    main.textContent = c.title; main.title = c.title;
+    main.addEventListener('click', function(){ openConversation(c.id); });
+    var acts = el('div', 'hacts');
+    var ren = el('button'); ren.type = 'button'; ren.innerHTML = icon('pencil');
+    ren.setAttribute('aria-label', 'Rename conversation'); ren.title = 'Rename';
+    ren.addEventListener('click', function(){ renameConversation(c); });
+    var del = el('button', 'del'); del.type = 'button'; del.innerHTML = icon('trash');
+    del.setAttribute('aria-label', 'Delete conversation'); del.title = 'Delete';
+    del.addEventListener('click', function(){ deleteConversation(c); });
+    acts.appendChild(ren); acts.appendChild(del);
+    item.appendChild(main); item.appendChild(acts);
+    box.appendChild(item);
+  });
+}
+async function loadConversations(){
+  var q = $('#search').value.trim();
+  try{
+    var d = await api('/api/conversations' + (q ? '?q=' + encodeURIComponent(q) : ''));
+    state.convs = d.conversations;
+    renderHistory();
+  }catch(err){
+    toast(err.message, 'error');
+  }
+}
+
+/* ---------- sidebar (mobile) ---------- */
+function openSidebar(){ $('#sidebar').classList.add('open'); $('#scrim').classList.add('show'); }
+function closeSidebar(){ $('#sidebar').classList.remove('open'); $('#scrim').classList.remove('show'); }
+
+/* ---------- conversation actions ---------- */
+function newChat(){
+  state.convId = null; state.title = ''; state.messages = []; state.error = null;
+  try{ localStorage.removeItem('cm-last'); }catch(e){}
+  updateTopbar(); renderMessages(); renderHistory(); closeSidebar();
+  $('#input').focus();
+}
+async function openConversation(id){
+  if(state.busy){ toast('Please wait for the current response to finish.'); return; }
+  try{
+    var d = await api('/api/conversations/' + id);
+    state.convId = d.conversation.id; state.title = d.conversation.title;
+    state.messages = d.messages; state.error = null;
+    try{ localStorage.setItem('cm-last', id); }catch(e){}
+    updateTopbar(); renderMessages(); renderHistory(); closeSidebar();
+  }catch(err){
+    toast(err.message, 'error');
+    if(err.code === 'conversation_not_found'){ loadConversations(); }
+  }
+}
+async function renameConversation(c){
+  var title = await askDialog({title:'Rename conversation', input:c.title, confirm:'Save'});
+  if(title === null){ return; }
+  try{
+    var d = await api('/api/conversations/' + c.id, {method:'PATCH', body:{title:title}});
+    if(c.id === state.convId){ state.title = d.conversation.title; updateTopbar(); }
+    await loadConversations();
+  }catch(err){ toast(err.message, 'error'); }
+}
+async function deleteConversation(c){
+  var ok = await askDialog({title:'Delete this conversation?', message:'"' + c.title + '" and all of its messages will be permanently deleted.', confirm:'Delete', danger:true});
+  if(!ok){ return; }
+  try{
+    await api('/api/conversations/' + c.id, {method:'DELETE'});
+    if(c.id === state.convId){ newChat(); }
+    await loadConversations();
+    toast('Conversation deleted');
+  }catch(err){ toast(err.message, 'error'); }
+}
+async function clearConversation(){
+  if(!state.convId || state.busy){ return; }
+  var ok = await askDialog({title:'Clear this conversation?', message:'All messages in this chat will be deleted. The chat itself stays in your history.', confirm:'Clear messages', danger:true});
+  if(!ok){ return; }
+  try{
+    await api('/api/conversations/' + state.convId + '/clear', {method:'POST', body:{}});
+    state.messages = []; state.error = null;
+    renderMessages(); loadConversations();
+    toast('Conversation cleared');
+  }catch(err){ toast(err.message, 'error'); }
+}
+
+/* ---------- sending and regenerating ---------- */
+async function sendMessage(raw){
+  var text = String(raw || '').trim();
+  if(!text || state.busy){ return; }
+  if(text.length > MAX_CHARS){ toast('Messages can be at most ' + MAX_CHARS + ' characters.', 'error'); return; }
+  setBusy(true); state.error = null;
+  var pushed = false;
+  try{
+    if(!state.convId){
+      var c = await api('/api/conversations', {method:'POST', body:{}});
+      state.convId = c.conversation.id; state.title = c.conversation.title;
+      try{ localStorage.setItem('cm-last', state.convId); }catch(e){}
+    }
+    state.messages.push({role:'user', content:text}); pushed = true;
+    $('#input').value = ''; autosize(); updateComposer();
+    renderMessages();
+    var data = await api('/api/conversations/' + state.convId + '/messages', {method:'POST', body:{content:text}});
+    state.messages.push(data.assistant_message);
+    state.title = data.conversation.title;
+  }catch(err){
+    state.error = err;
+    if(err.status === 0){
+      /* The server could not be reached: undo the optimistic bubble and keep the text. */
+      if(pushed){ state.messages.pop(); }
+      if(!$('#input').value){ $('#input').value = text; autosize(); }
+    }else{
+      await syncFromServer(text);
+    }
+  }finally{
+    setBusy(false); updateTopbar(); renderMessages(); loadConversations();
+  }
+}
+async function syncFromServer(draft){
+  /* After a failed request, show what the database really contains. */
+  if(!state.convId){ return; }
+  try{
+    var d = await api('/api/conversations/' + state.convId);
+    state.messages = d.messages; state.title = d.conversation.title;
+    var last = state.messages[state.messages.length - 1];
+    if((!last || last.role !== 'user') && draft && !$('#input').value){
+      $('#input').value = draft; autosize(); updateComposer();   /* message was not saved: give the text back */
+    }
+  }catch(e){ /* keep local state */ }
+}
+async function regenerate(){
+  if(state.busy || !state.convId || !state.messages.length){ return; }
+  setBusy(true); state.error = null;
+  var removed = null;
+  if(state.messages[state.messages.length - 1].role === 'assistant'){ removed = state.messages.pop(); }
+  renderMessages();
+  try{
+    var data = await api('/api/conversations/' + state.convId + '/regenerate', {method:'POST', body:{}});
+    state.messages.push(data.assistant_message);
+    state.title = data.conversation.title;
+  }catch(err){
+    if(removed){ state.messages.push(removed); }
+    if(err.status === 0){ err.retryable = true; }
+    state.error = err;
+  }finally{
+    setBusy(false); renderMessages(); loadConversations();
+  }
+}
+
+/* ---------- dialog ---------- */
+function askDialog(opts){
+  return new Promise(function(resolve){
+    var d = $('#dialog'), inp = $('#dlgInput'), ok = $('#dlgOk'), cancel = $('#dlgCancel');
+    $('#dlgTitle').textContent = opts.title;
+    $('#dlgMsg').textContent = opts.message || '';
+    $('#dlgMsg').hidden = !opts.message;
+    var hasInput = typeof opts.input === 'string';
+    inp.hidden = !hasInput;
+    if(hasInput){ inp.value = opts.input; }
+    ok.textContent = opts.confirm || 'OK';
+    ok.className = 'btn ' + (opts.danger ? 'danger' : 'primary');
+    d.hidden = false;
+    if(hasInput){ inp.focus(); inp.select(); } else { ok.focus(); }
+    function close(value){
+      d.hidden = true; d.onkeydown = null; d.onclick = null;
+      ok.onclick = null; cancel.onclick = null;
+      resolve(value);
+    }
+    ok.onclick = function(){ close(hasInput ? inp.value : true); };
+    cancel.onclick = function(){ close(null); };
+    d.onclick = function(e){ if(e.target === d){ close(null); } };
+    d.onkeydown = function(e){
+      if(e.key === 'Escape'){ close(null); }
+      if(e.key === 'Enter' && e.target === inp){ e.preventDefault(); ok.click(); }
+    };
+  });
+}
+
+/* ---------- theme ---------- */
+function applyTheme(theme){
+  var t = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', t);
+  try{ localStorage.setItem('cm-theme', t); }catch(e){}
+  var hl = $('#hljs-light'), hd = $('#hljs-dark');
+  if(hl && hd){ hl.disabled = (t === 'dark'); hd.disabled = (t !== 'dark'); }
+  $('#themeBtn').innerHTML = icon(t === 'dark' ? 'sun' : 'moon') + '<span class="lbl">' + (t === 'dark' ? 'Light mode' : 'Dark mode') + '</span>';
+  $('#themeLight').setAttribute('aria-pressed', String(t === 'light'));
+  $('#themeDark').setAttribute('aria-pressed', String(t === 'dark'));
+  /* Re-render so code blocks pick up the matching highlight theme. */
+  if(state.messages.length){ renderMessages(); }
+}
+async function setTheme(theme){
+  applyTheme(theme);
+  try{
+    var s = await api('/api/settings', {method:'POST', body:{theme:theme}});
+    state.settings = s;
+  }catch(err){ toast(err.message, 'error'); }
+}
+
+/* ---------- settings ---------- */
+async function loadSettings(){
+  var s = await api('/api/settings');
+  state.settings = s;
+  applyTheme(s.theme);
+  updateModelBadge(); updateBanner();
+}
+function fillSettings(){
+  var s = state.settings;
+  if(!s){ return; }
+  var ps = $('#setProvider'); ps.textContent = '';
+  s.providers.forEach(function(p){
+    var o = el('option'); o.value = p.id; o.textContent = p.label; o.selected = (p.id === s.provider);
+    ps.appendChild(o);
+  });
+  var p = currentProvider();
+  var ms = $('#setModel'); ms.textContent = '';
+  p.models.forEach(function(m){
+    var o = el('option'); o.value = m; o.textContent = m; o.selected = (m === s.model);
+    ms.appendChild(o);
+  });
+  $('#keyDot').className = 'dot' + (p.configured ? ' ok' : '');
+  $('#keyText').textContent = p.configured ? 'API key found: ' + p.masked_key : 'No API key found';
+  $('#keyHelp').textContent = p.configured
+    ? 'The key is read from ' + p.env_var + ' on your computer.'
+    : 'Add ' + p.env_var + '=your-key to the .env file next to app.py, then restart the app.';
+  $('#aboutText').textContent = s.app.name + ' version ' + s.app.version + '. ' + s.app.tagline + '.';
+  $('#testMsg').textContent = ''; $('#testMsg').className = 'testmsg';
+}
+function openSettings(){
+  fillSettings();
+  $('#settings').hidden = false;
+  $('#settingsClose').focus();
+}
+function closeSettings(){ $('#settings').hidden = true; }
+async function saveSettings(patch){
+  try{
+    state.settings = await api('/api/settings', {method:'POST', body:patch});
+    fillSettings(); updateModelBadge(); updateBanner();
+    toast('Settings saved');
+  }catch(err){
+    toast(err.message, 'error'); fillSettings();
+  }
+}
+async function testConnection(){
+  var btn = $('#testBtn'), msg = $('#testMsg');
+  btn.disabled = true; btn.textContent = 'Testing...';
+  msg.textContent = ''; msg.className = 'testmsg';
+  try{
+    var d = await api('/api/status/test', {method:'POST', body:{}});
+    msg.textContent = d.message; msg.className = 'testmsg ok';
+  }catch(err){
+    msg.textContent = err.message; msg.className = 'testmsg err';
+  }finally{
+    btn.disabled = false; btn.textContent = 'Test connection';
+  }
+}
+async function wipeHistory(){
+  var ok = await askDialog({title:'Delete all conversations?', message:'Every saved conversation and message will be permanently deleted.', confirm:'Delete everything', danger:true});
+  if(!ok){ return; }
+  try{
+    await api('/api/history/clear', {method:'POST', body:{confirm:true}});
+    newChat(); await loadConversations(); closeSettings();
+    toast('All conversations deleted');
+  }catch(err){ toast(err.message, 'error'); }
+}
+
+/* ---------- start-up ---------- */
+async function init(){
+  document.querySelectorAll('[data-icon]').forEach(function(n){
+    n.insertAdjacentHTML('afterbegin', icon(n.getAttribute('data-icon')));
+  });
+  var input = $('#input');
+  input.addEventListener('input', function(){ autosize(); updateComposer(); });
+  input.addEventListener('keydown', function(e){
+    if(e.key === 'Enter' && !e.shiftKey && !e.isComposing){
+      e.preventDefault();
+      sendMessage(input.value);
+    }
+  });
+  $('#sendBtn').addEventListener('click', function(){ sendMessage(input.value); });
+  $('#newChat').addEventListener('click', newChat);
+  $('#clearBtn').addEventListener('click', clearConversation);
+  $('#menuBtn').addEventListener('click', openSidebar);
+  $('#scrim').addEventListener('click', closeSidebar);
+  $('#themeBtn').addEventListener('click', function(){
+    setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+  });
+  $('#themeLight').addEventListener('click', function(){ setTheme('light'); });
+  $('#themeDark').addEventListener('click', function(){ setTheme('dark'); });
+  $('#settingsBtn').addEventListener('click', openSettings);
+  $('#modelBadge').addEventListener('click', openSettings);
+  $('#settingsClose').addEventListener('click', closeSettings);
+  $('#settings').addEventListener('click', function(e){ if(e.target === $('#settings')){ closeSettings(); } });
+  $('#settings').addEventListener('keydown', function(e){ if(e.key === 'Escape'){ closeSettings(); } });
+  $('#setProvider').addEventListener('change', function(e){ saveSettings({provider:e.target.value}); });
+  $('#setModel').addEventListener('change', function(e){ saveSettings({model:e.target.value}); });
+  $('#testBtn').addEventListener('click', testConnection);
+  $('#wipeBtn').addEventListener('click', wipeHistory);
+  var timer = null;
+  $('#search').addEventListener('input', function(){
+    clearTimeout(timer);
+    timer = setTimeout(loadConversations, 250);
+  });
+
+  applyTheme(document.documentElement.getAttribute('data-theme'));
+  renderMessages();
+  try{ await loadSettings(); }catch(err){ toast(err.message, 'error'); }
+  await loadConversations();
+  var last = null;
+  try{ last = localStorage.getItem('cm-last'); }catch(e){}
+  if(last && state.convs.some(function(c){ return c.id === last; })){ await openConversation(last); }
+  input.focus();
+}
+init();
+})();
+</script>
+</body>
+</html>
+{% endraw %}"""
+
+
+# Make sure the database exists even if the app is started another way.
+init_db()
+
+if __name__ == "__main__":
+    try:
+        port = int(os.environ.get("PORT", "5000"))
+    except ValueError:
+        port = 5000
+    print("=" * 60)
+    print(f" {APP_NAME} is running.")
+    print(f" Open this address in your browser: http://127.0.0.1:{port}")
+    print(" Press CTRL+C to stop the server.")
+    print("=" * 60)
+    # debug=False so error pages never reveal source code or secrets.
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
